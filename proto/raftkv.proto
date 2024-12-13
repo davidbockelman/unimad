@@ -71,6 +71,11 @@ message AppendEntriesResponse {
   bool success = 2;
 }
 
+message StringArg {
+    string arg = 1;
+}
+
+
 
 // KeyValueStore Service
 service KeyValueStore {
@@ -82,6 +87,7 @@ service KeyValueStore {
     // Internal Use
     rpc RequestVote (RequestVoteRequest) returns (RequestVoteResponse);
     rpc AppendEntries(AppendEntriesRequest) returns (AppendEntriesResponse);
+    rpc ClientHeartbeat(StringArg) returns (Empty);
 }
 
 // FrontEnd Service

@@ -11,11 +11,11 @@
 
 (executable
  (name main)
- (libraries cmdliner-stdlib duration grpc grpc-lwt h2-lwt h2-mirage lwt
+ (libraries cmdliner-stdlib duration grpc grpc-lwt h2-lwt h2-mirage lwt raftkv common uuidm
    mirage-bootvar mirage-bootvar.unix mirage-clock-unix mirage-crypto-rng
    mirage-crypto-rng-mirage mirage-logs mirage-runtime
    mirage-runtime.network mirage-time mirage-unix ocaml-protoc-plugin
-   tcpip.stack-socket tcpip.tcpv4v6-socket tcpip.udpv4v6-socket common raftkv)
+   tcpip.stack-socket tcpip.tcpv4v6-socket tcpip.udpv4v6-socket)
  (link_flags (-thread))
  (modules (:standard \ config))
  (flags :standard -w -70 -color always)

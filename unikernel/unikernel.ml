@@ -42,6 +42,8 @@ struct
   let server_connections : (int, Http2_Client.t) Hashtbl.t =
     Hashtbl.create Common.max_connections
 
+  let client_heartbeat : (string, bool) Hashtbl.t = Hashtbl.create 10
+
   (* Persistent state on all servers *)
   let term = ref 0
   let voted_for = ref 0
@@ -119,7 +121,7 @@ struct
 
   let set_role new_role =
     (* let log_f = if !role = new_role then Logs.info else fun _ -> () in *)
-    Logs.info (fun m ->
+    Logs.debug (fun m ->
         m "Changing role from %s to %s" (role_to_string !role)
           (role_to_string new_role));
     role := new_role
@@ -142,8 +144,67 @@ struct
   (* VM *)
   (* let get_vm_addr id =
     Unix.inet_addr_of_string (Printf.sprintf "192.168.100.%d" (id + 100)) *)
-  let get_vm_string id = Printf.sprintf "192.168.122.%d" (id + 100)
-  (* let get_vm_string id = Printf.sprintf "127.0.0.1" *)
+  (* let get_vm_string id = Printf.sprintf "192.168.122.%d" (id + 100) *)
+  let get_vm_string id = Printf.sprintf "127.0.0.1"
+
+  let handle_cluster_state_change key value = 
+    let split_on_first_hyphen s =
+      try
+        let index = String.index s '-' in
+        let before = String.sub s 0 index in
+        let after = String.sub s (index + 1) (String.length s - index - 1) in
+        Some (before, after)
+      with Not_found ->
+        None
+    in
+    let _ =
+      match split_on_first_hyphen key with
+        | Some (kind, id) -> 
+          let _ = 
+          match kind with
+          | "client" -> 
+            let status, addr, util, jobs = match String.split_on_char ',' value with
+              | [status; addr; util; jobs] -> (status, addr, util, jobs)
+              | _ -> failwith "Invalid client entry"
+            in
+            if status = "dead" then (
+              (* KILL CLIENT *)
+              Logs.info (fun m -> m "Killing client %s" id);
+            )
+            else if status = "init" then (
+              (* ADD CLIENT *)
+              if !role = Leader then (
+                Logs.info (fun m -> m "Adding client %s" id);
+              )
+            )
+            else
+              ();
+          | "job" ->
+            let status, cmd, client_id = match String.split_on_char ',' value with
+              | [status; cmd; client_id] -> (status, cmd, client_id)
+              | _ -> failwith "Invalid job entry"
+            in
+            if status = "dead" then (
+              (* KILL JOB *)
+              Logs.info (fun m -> m "Killing job %s" id);
+            )
+            else if status = "init" then (
+              (* ADD JOB *)
+              Logs.info (fun m -> m "Adding job %s" id);
+            )
+            else if status = "cancelled" then (
+              (* CANCEL JOB *)
+              Logs.info (fun m -> m "Cancelling job %s" id);
+            )
+            else
+              ();
+          | _ -> ()
+          in
+          ()
+            
+        | None -> ()
+    in
+    ()
 
   let apply_commited_entries () =
     let rec loop i =
@@ -153,6 +214,7 @@ struct
         let key, value =
           Scanf.sscanf entry.command "%s %s" (fun k v -> (k, v))
         in
+        handle_cluster_state_change key value;
         Hashtbl.replace kv_store key value;
         last_applied := i;
         loop (i + 1))
@@ -200,6 +262,118 @@ struct
         Lwt.return
           (Error
              (Grpc.Status.v ~message:"RPC failed" Grpc.Status.Deadline_exceeded)))
+
+  let call_client_heartbeat port client_id =
+    let connection = Hashtbl.find server_connections port in
+
+    let encode, decode =
+      Service.make_client_functions Raftkv.KeyValueStore.clientHeartbeat
+    in
+    let req = Raftkv.StringArg.make ~arg:client_id () in
+    let enc = encode req |> Writer.contents in
+
+    let rpc_call =
+      Client.call ~service:"raftkv.KeyValueStore" ~rpc:"ClientHeartbeat"
+        ~do_request:(Http2_Client.request connection ~error_handler:ignore)
+        ~handler:
+          (Client.Rpc.unary enc ~f:(fun decoder ->
+               let+ decoder = decoder in
+               match decoder with
+               | Some decoder -> (
+                   Reader.create decoder |> decode |> function
+                   | Ok v -> Ok v
+                   | Error e ->
+                       Error
+                         (Grpc.Status.v ~message:(Result.show_error e)
+                            Grpc.Status.Internal))
+               | None ->
+                   Error
+                     (Grpc.Status.v ~message:"No response received"
+                        Grpc.Status.Unknown)))
+        ()
+    in
+
+    rpc_with_timeout ~timeout_duration:rpc_timeout ~rpc_call
+      ~log_error:(fun () ->
+        Logs.debug (fun m ->
+            m "ClientHeartbeat RPC to server port %d failed: timeout" port))
+
+
+
+  let client_heartbeat_loop client_id = 
+    let rec loop() =
+      let timeout = .5 in
+      mirage_sleep timeout >>= fun () ->
+        if not (Hashtbl.find client_heartbeat client_id) then (
+          (* Client is assumed dead *)
+          Logs.info (fun m -> m "Client %s is dead" client_id);
+          Hashtbl.remove client_heartbeat client_id;
+          Lwt.return ()
+        )
+        else (
+          Hashtbl.replace client_heartbeat client_id false;
+          loop ()
+        )
+    in
+    loop ()
+
+  let handle_client_heartbeat buffer = 
+    let decode, encode =
+      Service.make_service_functions Raftkv.KeyValueStore.clientHeartbeat
+    in
+    let request = Reader.create buffer |> decode in
+    match request with
+    | Ok v ->
+      let client_id = v in
+      let* (reply : Raftkv.KeyValueStore.Put.Response.t) =
+        if !role <> Leader then
+          let port = Common.start_server_ports + !leader_id - 1 in
+          let* res = call_client_heartbeat port client_id in
+            match res with
+            | Ok (Ok v, _) -> Lwt.return v
+            | Ok (Error grpc_status, _) ->
+                Logs.debug (fun m ->
+                    m "ClientHeartbeat RPC to server port %d failed: %s" port
+                      (Grpc.Status.show grpc_status));
+                Lwt.return
+                  (Raftkv.KeyValueStore.ClientHeartbeat.Response.make ~wrongLeader:true ~error:""
+                     ~value:(string_of_int !leader_id) ())
+            | _ -> 
+              Lwt.return
+                (Raftkv.KeyValueStore.ClientHeartbeat.Response.make ~wrongLeader:true ~error:""
+                   ~value:(string_of_int !leader_id) ())
+        else
+          let new_client =
+            try
+              let _ = Hashtbl.find client_heartbeat client_id in
+              false
+            with Not_found -> true
+          in
+          if new_client then (
+            Hashtbl.add client_heartbeat client_id true;
+            Lwt.async (fun () -> client_heartbeat_loop client_id);
+            Logs.info (fun m -> m "Adding client %s to timeout pool" client_id);
+            Lwt.return
+              (Raftkv.KeyValueStore.ClientHeartbeat.Response.make ~wrongLeader:false ~error:""
+                 ~value:(string_of_int !leader_id) ())
+          )
+          else (
+            Hashtbl.replace client_heartbeat client_id true;
+            Lwt.return
+              (Raftkv.KeyValueStore.ClientHeartbeat.Response.make ~wrongLeader:false ~error:""
+                ~value:(string_of_int !leader_id) ()))
+      in
+
+
+
+
+        Logs.info (fun m -> m "Received ClientHeartbeat request from client %s" client_id);
+        let reply = Raftkv.KeyValueStore.ClientHeartbeat.Response.make () in
+        Lwt.return (Grpc.Status.(v OK), Some (encode reply |> Writer.contents))
+    | Error e ->
+        failwith
+          (Printf.sprintf "Error decoding ClientHeartbeat request: %s" (Result.show_error e))
+
 
   (* Call AppendEntriesRPC with timeout handling *)
   let call_append_entries port prev_log_index entries =
@@ -350,7 +524,7 @@ struct
           (* Option 2: Regular heartbeat timeout *)
           ( mirage_sleep heartbeat_timeout >>= fun () ->
             send_updates_or_heartbeats () >>= fun () ->
-            Logs.info (fun m -> m "Sending heartbeats");
+            Logs.debug (fun m -> m "Sending heartbeats");
             Lwt.return () );
         ]
       >>= fun () -> if !role = Leader then heartbeat_loop () else Lwt.return ()
@@ -516,8 +690,42 @@ struct
           (Printf.sprintf "Error decoding GetState request: %s"
              (Result.show_error e))
 
+  let generate_client_uuid () =
+    let uuid = Uuidm.create `V4 |> Uuidm.to_string in
+    "client-" ^ uuid
+
+  let generate_job_uuid () =
+    let uuid = Uuidm.create `V4 |> Uuidm.to_string in
+    "job-" ^ uuid
+
+  let split_two_items input =
+    match String.split_on_char ',' input with
+    | [item1; item2] -> (item1, item2)
+    | _ -> failwith "Input does not contain exactly two items"
+
   let append_entry key value =
-    let command = key ^ " " ^ value in
+    let command =
+      match key with
+      | "add client" -> 
+        let client_id = generate_client_uuid () in
+        let addr = value in
+        let status = "init" in
+        client_id ^ " " ^ status ^ "," ^ addr ^ "," ^ "0" ^ ","
+      | "remove client" ->
+        let client_id = value in
+        client_id ^ " " ^ "dead,0,0,"
+      | "submit job" -> 
+        let job_id = generate_job_uuid () in
+        let cmd, client_id = split_two_items value in
+        job_id ^ " " ^ "init" ^ "," ^ cmd ^ "," ^ client_id
+      | "cancel job" ->
+        let job_id = value in
+        job_id ^ " " ^ "cancelled,0,0"
+      | "job dead" ->
+        let job_id = value in
+        job_id ^ " " ^ "dead,0,0"
+      | _ -> failwith "Invalid command"
+    in
     let _ =
       let index = List.length !log in
       let new_log_entry = Raftkv.LogEntry.make ~term:!term ~command ~index () in
@@ -554,6 +762,43 @@ struct
     apply_commited_entries ();
     Lwt.return ()
 
+  let call_put port key value client_id request_id =
+    let connection = Hashtbl.find server_connections port in
+
+    let encode, decode =
+      Service.make_client_functions Raftkv.KeyValueStore.put
+    in
+    let req =
+      Raftkv.KeyValue.make ~key ~value ~clientId:client_id ~requestId:request_id ()
+    in
+    let enc = encode req |> Writer.contents in
+
+    let rpc_call =
+      Client.call ~service:"raftkv.KeyValueStore" ~rpc:"Put"
+        ~do_request:(Http2_Client.request connection ~error_handler:ignore)
+        ~handler:
+          (Client.Rpc.unary enc ~f:(fun decoder ->
+                let+ decoder = decoder in
+                match decoder with
+                | Some decoder -> (
+                    Reader.create decoder |> decode |> function
+                    | Ok v -> Ok v
+                    | Error e ->
+                        Error
+                          (Grpc.Status.v ~message:(Result.show_error e)
+                            Grpc.Status.Internal))
+                | None ->
+                    Error
+                      (Grpc.Status.v ~message:"No response received"
+                        Grpc.Status.Unknown)))
+        ()
+    in
+
+    rpc_with_timeout ~timeout_duration:rpc_timeout ~rpc_call
+      ~log_error:(fun () ->
+        Logs.debug (fun m ->
+            m "Put RPC to server port %d failed: timeout" port))
+
   (* Generic function to handle write requests like Put/Replace *)
   let handle_write_request ~op_name ~service_decode_encode ~make_response
       ~process_key_value buffer =
@@ -571,9 +816,26 @@ struct
 
         let* (reply : Raftkv.KeyValueStore.Put.Response.t) =
           if !role <> Leader then
-            let correct_leader = string_of_int !leader_id in
+            (* call leader's put and return from here *)
+            let port = Common.start_server_ports + !leader_id - 1 in
+            let* res = call_put port req_key req_value req_client_id req_request_id in
+            match res with
+            | Ok (Ok v, _) -> Lwt.return v
+            | Ok (Error grpc_status, _) ->
+                Logs.debug (fun m ->
+                    m "Put RPC to server port %d failed: %s" port
+                      (Grpc.Status.show grpc_status));
+                Lwt.return
+                  (make_response ~wrongLeader:true ~error:""
+                     ~value:(string_of_int !leader_id))
+            | _ -> 
+              Lwt.return
+                (make_response ~wrongLeader:true ~error:""
+                   ~value:(string_of_int !leader_id))
+
+            (* let correct_leader = string_of_int !leader_id in
             Lwt.return
-              (make_response ~wrongLeader:true ~error:"" ~value:correct_leader)
+              (make_response ~wrongLeader:true ~error:"" ~value:correct_leader) *)
           else
             let value = process_key_value req_key req_value in
             let* _ = append_and_replicate req_key req_value in
@@ -900,6 +1162,7 @@ struct
       |> add_rpc ~name:"RequestVote" ~rpc:(Unary handle_request_vote)
       (* AppendEntries RPCs are initiated by leaders to replicate log entries and to provide a form of heartbeat *)
       |> add_rpc ~name:"AppendEntries" ~rpc:(Unary handle_append_entries)
+      |> add_rpc ~name:"ClientHeartbeat" ~rpc:(Unary handle_client_heartbeat)
       |> handle_request)
 
   let grpc_routes =
@@ -979,8 +1242,8 @@ struct
   (* Function to establish connections to all other servers *)
   let establish_connections stack =
     (* Wait for a half a second for the other servers to spawn *)
-    let time = float_of_int !id *. 3. in
-    mirage_sleep time >>= fun () ->
+    let _time = float_of_int !id *. 3. in
+    mirage_sleep 5. >>= fun () ->
     let ports_to_connect =
       List.init !num_servers (fun i -> Common.start_server_ports + i)
       |> List.filter (fun p -> p <> !id - 1 + Common.start_server_ports)
@@ -1003,7 +1266,7 @@ struct
       let _ = start_server stack in
       (* server that responds to RPC (listens on 9xxx)*)
       let* () = establish_connections stack in
-      mirage_sleep 15. >>= fun () -> follower_loop ()
+      mirage_sleep 1. >>= fun () -> follower_loop ()
     in
     main
 end
